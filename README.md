@@ -4,6 +4,8 @@ A Node.js transcription pipeline: upload an audio file in any common format and 
 
 Speech-to-text uses **open-source Whisper running locally** through [transformers.js](https://github.com/huggingface/transformers.js) (ONNX Runtime). There's no Python, no paid API, and audio never leaves the machine.
 
+**Contents:** [Quick start](#quick-start) · [API](#api) · [Design decisions](#design-decisions) (formats, long audio) · [Verified results](#verified-results-cpu-whisper-base-q8) · [Tests](#tests) · [System design: scaling to production](#system-design-scaling-to-production) (concurrent uploads, storage, retries, API)
+
 ```
 POST /transcribe  ──►  probe (ffprobe)  ──►  normalize (ffmpeg → 16 kHz mono PCM, streamed to disk)
                                                    │  + per-frame energy profile
@@ -133,11 +135,63 @@ npm test
 
 Settings are environment variables; `.env` is loaded automatically by the npm scripts. See [.env.example](.env.example). The main ones are `WHISPER_MODEL`, `WHISPER_DTYPE`, `SYNC_MAX_DURATION_SEC`, `MAX_UPLOAD_MB`, `MAX_DURATION_SEC`, `JOB_CONCURRENCY` and `SILENCE_RMS`.
 
-## What I'd add for production
+## System design: scaling to production
 
-- **Durable queue and workers:** BullMQ/Redis or SQS with separate worker processes, so jobs survive restarts and scale out horizontally. Chunks are independent, so one file can also be spread across workers. Chunk results would be checkpointed so a crashed job resumes instead of restarting.
-- **Object storage** (S3) for uploads and results instead of the local temp directory, plus a webhook callback as an alternative to polling.
+This repo is a single process: an in-memory queue, local temp files, CPU inference. Below is how I'd turn it into a multi-tenant production service, and what each part builds on in the current code.
+
+```
+ Client ──► API (stateless, behind a load balancer) ──► Postgres (jobs, segments)
+   │            │  auth, rate limits, validation           ▲
+   │            └──► Queue (BullMQ/Redis or SQS) ──► Workers (GPU, autoscaled on queue depth)
+   │                                                        │  probe → normalize → chunk → transcribe
+   └── presigned upload ──► S3 (audio, exports) ◄───────────┘  checkpoint each chunk's result
+                                                           └──► webhook to client when done
+```
+
+### Concurrent uploads
+
+- **Separate accepting work from doing it.** This already holds in the repo: uploads stream to disk with size limits enforced during the upload, every file is checked with ffprobe before it's queued, and *all* transcription goes through one FIFO queue with a concurrency limit. A burst of 100 uploads is accepted quickly, but only `JOB_CONCURRENCY` transcriptions run on the CPU at once; the rest wait and report their queue position.
+- **Upload straight to storage.** Clients upload to S3 through presigned URLs, so API servers never handle the audio bytes and stay light, stateless and horizontally scalable.
+- **Durable queue and worker pool.** Jobs go on BullMQ/Redis or SQS. Separate workers (GPU, if available) scale with queue depth. Chunks are independent, so one long file can be spread across several workers.
+- **Protection.** Per-client rate limits and quotas, `429` when the queue is too deep, an `Idempotency-Key` header so a retried upload doesn't create a duplicate job, and content-hash deduplication so identical files aren't transcribed twice.
+
+### Storing audio and transcripts
+
+- **Audio in object storage** (S3/GCS), stored under the job ID, encrypted at rest (SSE-KMS) and accessed through short-lived presigned URLs. A lifecycle rule deletes raw audio after a retention period (e.g. 30 days): audio is large and may contain personal data, while the transcript is the long-term record.
+- **Job metadata in Postgres:** a `jobs` table (id, owner, status, progress, attempts, source format, duration, model, error, timestamps). Status polling reads from here.
+- **Transcripts:** full text plus segments, either as a JSONB column or a `segments(job_id, idx, start, end, text)` table, which makes time-range queries easy. Full-text search uses Postgres `tsvector`, or OpenSearch at larger scale.
+- **Per-chunk results** are saved as each chunk finishes, so a failed job can resume (see below).
+- **Exports** (SRT, VTT, TXT) are generated on demand from the stored segments, as `src/transcription/formats.js` already does, and cached in S3 if they're requested often.
+
+### Retrying and recovering failed transcriptions
+
+- **Separate permanent failures from temporary ones.** This already exists: bad input (not audio, no audio track, too long, can't be decoded) raises a `PipelineError` with a 4xx code, so the job fails immediately with a clear message and is never retried, because a corrupt file won't get better.
+- **Temporary failures** (worker crash, out of memory, timeout, model or network errors) are retried with exponential backoff and jitter, up to about 3 attempts. After that the job goes to a dead-letter queue, raises an alert, and can be re-run with `POST /jobs/:id/retry`.
+- **Resume, don't restart.** Because each chunk's result is saved, a retry skips the chunks that already finished, which matters for hour-long files.
+- **Crashed workers.** Heartbeats plus a visibility timeout (BullMQ stalled-job detection or SQS visibility) put a dead worker's job back on the queue automatically. Each chunk has its own timeout so one bad chunk can't stall the whole job.
+- **Fallback.** A chunk that keeps failing can be retried on a different engine or model, which the engine interface makes easy to swap. Jobs are keyed by ID, so re-running one never creates a duplicate.
+
+### Exposing it as an API
+
+The core already exists (`POST /transcribe`, `GET /jobs/:id`, `GET /jobs/:id/result?format=`, `GET /health`, and one JSON error format). For production:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/uploads` | Returns a presigned S3 URL for large files |
+| `POST /v1/transcriptions` | `{ upload_id \| audio_url, language?, callback_url? }`, or multipart for small files. Short files return `200` with the result; others return `202` plus a `Location` header |
+| `GET /v1/transcriptions/:id` | Status, queue position, chunk progress |
+| `GET /v1/transcriptions/:id/result?format=json\|txt\|srt\|vtt` | Result in any format |
+| `GET /v1/transcriptions` | List, with cursor pagination |
+| `POST /v1/transcriptions/:id/retry` | Manual re-run of a failed job |
+
+- Versioned under `/v1` and documented with OpenAPI.
+- Authenticated with API keys or OAuth, with per-key rate limits, `Idempotency-Key` support and request IDs for tracing.
+- An HMAC-signed `callback_url` webhook as an alternative to polling.
+- Later: a WebSocket endpoint that streams live audio and returns partial transcripts in real time.
+
+### Other improvements
+
 - **GPU inference** (whisper.cpp with CUDA, or faster-whisper behind a small service) for about 10–50× throughput, and a larger model.
 - **A neural VAD** (Silero) instead of energy-based silence detection, for noisy recordings where an energy threshold isn't reliable.
 - **Optional extras:** speaker diarization, word-level timestamps (`return_timestamps: 'word'`), and reporting the detected language.
-- **Operations:** auth/API keys, rate limiting, request IDs, structured logs, and metrics (real-time factor, queue depth, failure rate).
+- **Observability:** structured logs, metrics (real-time factor, queue depth, failure rate, time per chunk), and tracing across the API, queue and workers.
