@@ -1,0 +1,4 @@
+node_modules/
+samples/
+*.f32
+.env

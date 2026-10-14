@@ -1,0 +1,30 @@
+{
+  "name": "transcription-service",
+  "version": "1.0.0",
+  "description": "Audio transcription pipeline: upload any audio format, get text with per-segment timestamps. Local open-source Whisper via transformers.js.",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "transcribe": "bin/transcribe.js"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "dev": "node --env-file-if-exists=.env --watch src/server.js",
+    "transcribe": "node --env-file-if-exists=.env bin/transcribe.js",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\"",
+    "samples": "powershell -ExecutionPolicy Bypass -File scripts/make-samples.ps1"
+  },
+  "engines": {
+    "node": ">=22.9"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.1",
+    "express": "^5.3.0",
+    "multer": "^2.4.0"
+  },
+  "optionalDependencies": {
+    "ffmpeg-static": "^5.3.0",
+    "ffprobe-static": "^3.1.0"
+  }
+}
